@@ -7,7 +7,7 @@ This repository contains an experimental ARC-AGI-2 inference system combining tw
 * **NVARC** — a neural ARC solver derived from the public *Failed in AIMO* v1 notebook and the Sorokin Qwen model.
 * **TRM** — a Tiny Recursive Model based on Samsung SAIL Montreal's TinyRecursiveModels implementation and the public `cpmpml/arc-prize-trm-031` checkpoint.
 
-The system is designed for **offline inference on a single Kaggle GPU**, with managed GPU scheduling between TRM training and NVARC inference.
+The system is designed for **offline inference under a four-GPU L4 execution budget**, with GPU scheduling, solver handoff, independent candidate generation, and label-free evidence-based selection.
 
 > **Important:** The measured-input independence projection reported for this candidate is **40.0419%**. This is **not an ARC-AGI-2 competition score** and must not be interpreted as a leaderboard result. Promotion requires a completed Kaggle rerun and a corresponding leaderboard receipt.
 
@@ -15,19 +15,37 @@ The system is designed for **offline inference on a single Kaggle GPU**, with ma
 
 ## Overview
 
-The candidate combines two independent neural solver families:
+The candidate runs two solver families with different computational roles.
 
 ### NVARC
 
-NVARC provides the primary neural ARC solver family.
+Three NVARC workers initially occupy:
 
-The experimental system can run multiple NVARC workers through managed scheduling, but the Kaggle execution environment uses **one GPU**, so the workers are executed through sequential/resource-managed GPU scheduling rather than assuming four physical GPUs.
+```text
+GPU 0 → NVARC worker 0
+GPU 1 → NVARC worker 1
+GPU 2 → NVARC worker 2
+```
+
+The tasks are ordered using an **input-only estimate of computational work**, based on:
+
+* training input size,
+* training output size,
+* estimated test output size,
+* augmented token work,
+* estimated decoding work.
+
+No evaluation labels are used to construct this ordering.
 
 ### TRM
 
-TRM uses the same Kaggle GPU for its training phase.
+While the first three NVARC workers run, GPU 3 is reserved for TRM:
 
-TRM trains for up to:
+```text
+GPU 3 → TRM training
+```
+
+TRM runs for up to:
 
 ```text
 4,000 epochs
@@ -40,102 +58,61 @@ TRM @ 2,000 epochs
 TRM @ 4,000 epochs
 ```
 
-After the TRM phase completes, the GPU is released for the NVARC inference phase.
+After TRM completes, GPU 3 is released and becomes the delayed fourth NVARC worker:
+
+```text
+GPU 3 → NVARC worker 3
+```
+
+The handoff is coordinated through a filesystem marker so that the fourth NVARC worker does not claim GPU 3 while TRM still owns it.
 
 ---
 
-## Kaggle Runtime
+## Solver Architecture
 
-The intended competition environment is:
-
-```text
-Kaggle
-Offline execution
-1 × NVIDIA L4 GPU
-12-hour rerun limit
-```
-
-The project is therefore designed around **one physical GPU**, not four simultaneously available GPUs.
-
-The GPU is managed between the two solver families:
+The high-level execution flow is:
 
 ```text
-                 Kaggle
-                   │
-             1 × NVIDIA L4
-                   │
-          ┌────────┴────────┐
-          │                 │
-          ▼                 │
-     TRM training           │
-          │                 │
-    2,000 epochs            │
-    4,000 epochs            │
-          │                 │
-          ▼                 │
-      TRM receipt           │
-          │                 │
-          ▼                 │
-       GPU released         │
-          │                 │
-          ▼                 │
-     NVARC inference        │
-          │                 │
-          ▼                 │
-    Candidate generation    │
-          │                 │
-          └────────┬────────┘
-                   ▼
-          Evidence selector
-                   │
-                   ▼
-             submission.json
-```
-
-The execution is designed to stop approximately **10 minutes before the 12-hour rerun limit**.
-
----
-
-## Solver Pipeline
-
-The high-level pipeline is:
-
-```text
-ARC-AGI-2 Tasks
-       │
-       ▼
-Input-only work estimation
-       │
-       ▼
-Lowest-work-first queue
-       │
-       ├───────────────┐
-       │               │
-       ▼               ▼
-     NVARC            TRM
-       │          2,000 / 4,000
-       │             epochs
-       │               │
-       │               ▼
-       │          Final TRM
-       │          candidates
-       │               │
-       └───────┬───────┘
-               ▼
-       Label-free evidence
-           selection
-               │
-       ┌───────┴────────┐
-       ▼                ▼
-  NVARC rank 1      TRM rank 1
-       │                │
-       └───────┬────────┘
-               ▼
-      Duplicate-aware
-         fallbacks
-               │
-               ▼
-        submission.json
+                    ARC-AGI-2 Tasks
+                           │
+                           ▼
+              Input-only work estimation
+                           │
+                           ▼
+                 Lowest-work-first queue
+                           │
+            ┌──────────────┴──────────────┐
+            │                             │
+            ▼                             ▼
+      NVARC Workers                  TRM Training
+        GPU 0-2                         GPU 3
+            │                             │
+            │                        2,000 epochs
+            │                        4,000 epochs
+            │                             │
+            │                             ▼
+            │                       GPU 3 released
+            │                             │
+            └──────────────┬──────────────┘
+                           ▼
+                  NVARC Worker 3
+                       GPU 3
+                           │
+                           ▼
+                 Candidate generation
+                           │
+                           ▼
+             Label-free evidence selector
+                           │
+          ┌────────────────┼────────────────┐
+          │                │                │
+          ▼                ▼                ▼
+     NVARC rank 1     TRM rank 1       Fallbacks
+          │                │                │
+          └────────────────┴────────────────┘
+                           │
+                           ▼
+                    submission.json
 ```
 
 ---
@@ -144,58 +121,98 @@ Lowest-work-first queue
 
 The final candidate uses a **label-free evidence selector**.
 
-The selection policy combines evidence from the independent solver families.
+The selection policy combines evidence from the independent solver families rather than simply selecting a single model's output.
 
-Priority is given to:
+The intended priority is:
 
 1. **Cross-solver agreement**
 2. **Rules that are exact on all available training pairs**
 3. **NVARC rank-one candidate**
 4. **Final TRM rank-one candidate**
-5. **Distinct rank-two NVARC/TRM fallbacks when required for duplicates**
+5. **Distinct rank-two fallbacks when required to avoid duplicate attempts**
 
-The scored attempts are therefore based on:
+The final scored attempts are therefore based on:
 
 ```text
 NVARC rank 1
 TRM rank 1
 ```
 
-Distinct NVARC/TRM rank-two candidates are retained only as fallbacks for duplicate cases.
+with distinct NVARC/TRM rank-two candidates retained as fallbacks for duplicate cases.
+
+The final merge stage uses an evidence policy and produces a selection receipt.
 
 ---
 
-## Label-Free Evaluation
+## Label-Free Evaluation Design
 
 A key constraint of this candidate is:
 
 > **Evaluation labels are never read during inference.**
 
-The inference process uses the task inputs and training pairs to generate candidates.
+In evaluation mode, the notebook loads:
 
-The evidence selector uses:
+```text
+arc-agi_evaluation_challenges.json
+```
 
-* cross-solver agreement,
-* rules discovered from training pairs,
-* solver candidate rankings,
+and uses the corresponding solutions only for **post-inference validation/benchmarking**.
 
-without reading evaluation answers to choose predictions.
+The inference process itself does not use evaluation labels to select predictions.
 
-Evaluation labels, where available, are used for post-inference measurement rather than candidate selection.
+For competition reruns, the system switches to:
+
+```text
+arc-agi_test_challenges.json
+```
+
+and produces the final competition submission.
 
 ---
 
-## Input-Only Work Ordering
+## Work Ordering
 
-This experimental sibling orders NVARC tasks using an **input-only estimate of augmented token and output-decoding work**.
+This experimental sibling uses an **input-only lowest-work-first queue**.
 
-The purpose is to prioritize tasks according to estimated computational cost without using evaluation labels.
+For each ARC task, the estimated work includes:
 
-The exact sorted-order control and the aggressive reference are preserved as separate experimental notebooks.
+```text
+training input cells
++ training output cells
++ estimated test output cells
+```
+
+with the training component scaled for augmentation and the decoding component scaled according to estimated output size.
+
+Conceptually:
+
+```text
+estimated work =
+    16 × (training input + training output)
+    + 8 × estimated test output
+```
+
+The estimated test output is derived from the median training input/output size ratio.
+
+Tasks are then sorted by:
+
+```text
+estimated work
+estimated output size
+total training size
+test input size
+task ID
+```
+
+This ordering is based only on information available from the task inputs/training examples.
 
 ---
 
 ## Alternative Variants
+
+This repository represents one experimental sibling of the ARC 2026 system.
+
+Other variants are intentionally preserved separately:
 
 ### Exact Sorted-Order Control
 
@@ -203,74 +220,117 @@ A control variant preserving the exact sorted task ordering.
 
 ### Aggressive Reference
 
-An aggressive reference configuration preserved separately for comparison.
+An aggressive reference configuration preserved for comparison against the evidence-selection candidate.
 
-### Evidence-Selection Candidate
-
-This candidate combines:
-
-* input-only lowest-work-first scheduling,
-* label-free evidence selection,
-* cross-solver agreement,
-* training-pair exact-rule evidence,
-* NVARC rank-one output,
-* final TRM rank-one output,
-* duplicate-aware rank-two fallbacks.
+These variants allow the effect of queue ordering and candidate-selection policy to be evaluated independently.
 
 ---
 
-## TRM
+## Runtime
 
-TRM is trained on the Kaggle GPU before the GPU is handed to NVARC inference.
-
-The training produces:
+The intended environment is:
 
 ```text
-TRM @ 2,000 epochs
-TRM @ 4,000 epochs
+Offline execution
+4 × NVIDIA L4 GPUs
+Kaggle ARC-AGI-2 environment
 ```
 
-The two checkpoints/receipts provide an intermediate and final TRM candidate.
+GPU allocation:
 
-The final TRM candidate is used as the **TRM rank-one** solver output.
+| GPU   | Initial Role   | Later Role     |
+| ----- | -------------- | -------------- |
+| GPU 0 | NVARC worker 0 | NVARC          |
+| GPU 1 | NVARC worker 1 | NVARC          |
+| GPU 2 | NVARC worker 2 | NVARC          |
+| GPU 3 | TRM training   | NVARC worker 3 |
+
+The execution is designed to stop approximately **10 minutes before the 12-hour rerun limit**.
+
+Internet access is disabled during the intended execution.
 
 ---
 
-## NVARC
+## TRM Configuration
 
-NVARC is the second independent neural solver family.
+During competition rerun mode, TRM is launched on physical GPU 3 with:
 
-Its provenance is based on:
+```text
+TRM_WORLD_SIZE       = 1
+TRM_EPOCHS           = 4000
+TRM_EVAL_INTERVAL    = 2000
+TRM_GLOBAL_BATCH_SIZE = 112
+TRM_LR                = 0.0000875
+TRM_WARMUP_STEPS      = 229
+TRM_NUM_AUG          = 128
+OMP_NUM_THREADS       = 4
+```
 
-* Koushik Rudra's Apache-2.0 public *Failed in AIMO version 1* notebook
-* the Apache-2.0 Sorokin Qwen model
+The runtime generates:
 
-NVARC generates ranked candidate solutions for ARC tasks.
+```text
+trm_submission_early.json
+trm_submission_final.json
+```
 
-The final selector uses the NVARC rank-one candidate as one of the two primary scored candidates.
+corresponding to the intermediate and final TRM checkpoints.
 
 ---
 
-## Runtime Constraints
+## NVARC Runtime
+
+NVARC workers are launched through multiprocessing.
+
+Each worker receives a portion of the shared task queue and is assigned a physical GPU through:
 
 ```text
-Platform:       Kaggle
-GPU:            1 × NVIDIA L4
-Internet:       Disabled
-Execution:      Offline
-Time limit:     12 hours
-Safety margin:  ~10 minutes
+CUDA_VISIBLE_DEVICES
 ```
 
-The system does **not** assume access to four physical GPUs.
+The first three workers begin independently while GPU 3 remains reserved for TRM.
 
-The single GPU is reused between computational phases:
+The final NVARC worker waits for the TRM handoff marker before starting.
+
+This avoids simultaneous ownership of GPU 3 by TRM and NVARC.
+
+---
+
+## Competition vs Evaluation Mode
+
+The notebook distinguishes between local/evaluation execution and competition rerun execution.
+
+### Evaluation mode
+
+Uses:
 
 ```text
-TRM → GPU release → NVARC
+arc-agi_evaluation_challenges.json
+arc-agi_evaluation_solutions.json
 ```
 
-This makes the candidate compatible with a one-GPU Kaggle execution environment.
+The evaluation solutions are loaded only for validation and benchmarking after candidate generation.
+
+### Competition rerun
+
+Uses:
+
+```text
+arc-agi_test_challenges.json
+```
+
+No test labels are available to the inference pipeline.
+
+The final output is:
+
+```text
+submission.json
+```
+
+and the NVARC intermediate submission is retained as:
+
+```text
+nvarc_submission.json
+```
 
 ---
 
@@ -280,27 +340,25 @@ Important runtime artifacts include:
 
 ```text
 submission.json
-
 nvarc_submission.json
 
 trm_submission_early.json
 trm_submission_final.json
 
 selector-receipt.json
-
 trm-gpu3.log
 trm-gpu3-released.json
 ```
 
 These artifacts provide evidence for:
 
-* NVARC candidate generation
+* NVARC output generation
 * TRM intermediate output
 * TRM final output
 * final candidate selection
-* solver agreement
-* GPU phase transitions
-* duplicate handling
+* TRM execution status
+* GPU handoff
+* solver agreement/selection decisions
 
 ---
 
@@ -312,57 +370,49 @@ This candidate reports a measured-input independence projection of:
 40.0419%
 ```
 
-This value is **not**:
+This value is a **measurement associated with the experimental independence analysis**.
+
+It is **not**:
 
 * an ARC-AGI-2 leaderboard score,
 * a Kaggle competition score,
 * a validation accuracy,
-* or a prediction of final competition performance.
+* or evidence of final competition performance.
 
-It is an experimental independence measurement.
-
-Promotion of the candidate requires:
-
-```text
-Completed Kaggle rerun
-        +
-Leaderboard receipt
-```
-
-Only the resulting competition evidence should be used to report an actual competition score.
+A competition claim requires an actual completed Kaggle rerun and the resulting leaderboard receipt.
 
 ---
 
-## Provenance and Licensing
+## Provenance
 
 ### NVARC
 
 NVARC is derived from:
 
-* Koushik Rudra's Apache-2.0 public *Failed in AIMO version 1* notebook
+* Koushik Rudra's public **Failed in AIMO version 1** notebook
 * the Apache-2.0 Sorokin Qwen model
 
-Inherited components retain their original licenses.
+The inherited components retain their original licensing.
 
 ### TRM
 
 TRM uses:
 
-* Samsung SAIL Montreal's MIT **TinyRecursiveModels** source
-* the public CC0 `cpmpml/arc-prize-trm-031` checkpoint
+* Samsung SAIL Montreal's **TinyRecursiveModels** source
+* the public `cpmpml/arc-prize-trm-031` checkpoint
 
-Inherited components retain their original licenses.
+The referenced TinyRecursiveModels source is licensed under MIT, while the referenced public checkpoint is distributed under CC0.
 
-### Original Orchestration
+### Original orchestration
 
-The original orchestration for this experimental candidate is:
+The orchestration and integration introduced for this project are:
 
 ```text
 Copyright 2026 Christopher D. Aleman
 MIT-0
 ```
 
-Inherited components remain subject to their respective licenses.
+Inherited components retain their respective licenses.
 
 ---
 
@@ -374,41 +424,84 @@ The original orchestration is released under:
 MIT-0
 ```
 
-This repository also contains or derives from components distributed under other licenses.
+However, this repository incorporates components with their own licenses.
 
-Therefore, the repository should **not** be interpreted as relicensing inherited components.
+Therefore:
 
-Each inherited component retains its applicable upstream license.
+> **Do not treat the entire repository as having a single inherited license for every component.**
+
+The applicable license for each inherited component remains the license under which that component was originally released.
+
+See the provenance section and the corresponding upstream sources for component-specific licensing.
 
 ---
 
-## Reproducibility
+## Reproducibility Notes
 
-The intended execution environment is:
+This project is intentionally designed around an offline execution environment.
 
-```text
-Kaggle
-1 × NVIDIA L4
-Offline
-≤ 12 hours
-```
-
-The candidate is designed specifically around the single-GPU constraint.
-
-The core scheduling strategy is:
+The intended constraints are:
 
 ```text
-1. Start TRM on the Kaggle GPU.
-2. Train through the required TRM checkpoints.
-3. Export the 2,000-epoch and 4,000-epoch receipts.
-4. Release the GPU.
-5. Run NVARC inference using the same GPU.
-6. Generate ranked NVARC candidates.
-7. Combine NVARC and TRM candidates.
-8. Apply the label-free evidence selector.
-9. Resolve duplicate candidates using distinct rank-two fallbacks.
-10. Write the final submission.
+Internet: disabled
+GPUs: 4 × NVIDIA L4
+Execution budget: < 12 hours
+Safety margin: ~10 minutes
 ```
+
+The system also relies on the competition/runtime environment providing the expected ARC-AGI-2 datasets and, for the TRM rerun, the attached TRM runtime source and local wheels.
+
+The TRM competition rerun expects the attached source package containing:
+
+```text
+trm_runtime.py
+bootstrap_runtime.py
+merge_agreement.py
+wheels/
+```
+
+---
+
+## Repository Structure
+
+A recommended repository structure is:
+
+```text
+arc-2026-nvarc-trm/
+│
+├── notebooks/
+│   ├── fork-of-arc-2026.ipynb
+│   ├── sorted-order-control.ipynb
+│   └── aggressive-reference.ipynb
+│
+├── src/
+│   ├── starter.py
+│   ├── arc_solver.py
+│   ├── arc_loader.py
+│   ├── arc_decoder.py
+│   └── ...
+│
+├── trm/
+│   ├── trm_runtime.py
+│   ├── merge_agreement.py
+│   └── ...
+│
+├── receipts/
+│   ├── trm-2000.json
+│   ├── trm-4000.json
+│   └── selector-receipt.json
+│
+├── submissions/
+│   ├── nvarc_submission.json
+│   ├── trm_submission_early.json
+│   ├── trm_submission_final.json
+│   └── submission.json
+│
+├── LICENSE
+└── README.md
+```
+
+The exact repository layout may differ from the Kaggle notebook layout.
 
 ---
 
@@ -416,20 +509,20 @@ The core scheduling strategy is:
 
 **Status: Experimental ARC-AGI-2 candidate**
 
-This project combines:
+The system is intended as a research/competition experiment combining:
 
 * independent neural solver families,
-* single-GPU Kaggle execution,
-* managed GPU reuse,
+* offline execution,
+* multi-GPU scheduling,
+* delayed GPU handoff,
 * input-only workload estimation,
-* label-free solver selection,
-* cross-solver agreement,
-* exact training-pair rule evidence,
-* duplicate-aware candidate generation.
+* solver agreement,
+* training-pair rule evidence,
+* duplicate-aware candidate selection.
 
-The reported **40.0419% independence projection is not a competition score**.
+The reported **40.0419% independence projection should not be presented as a competition score**.
 
-A competition result should only be reported after a completed Kaggle rerun and the corresponding leaderboard receipt.
+Final competition performance should only be reported after the corresponding Kaggle rerun and leaderboard receipt have been completed.
 
 ---
 
@@ -437,9 +530,9 @@ A competition result should only be reported after a completed Kaggle rerun and 
 
 This project builds upon publicly available work from:
 
-* Koushik Rudra / *Failed in AIMO*
-* Sorokin / Qwen
-* Samsung SAIL Montreal / *TinyRecursiveModels*
+* Koushik Rudra / **Failed in AIMO**
+* Sorokin / **Qwen**
+* Samsung SAIL Montreal / **TinyRecursiveModels**
 * `cpmpml/arc-prize-trm-031`
 
 All inherited components remain subject to their respective licenses.
@@ -448,12 +541,12 @@ All inherited components remain subject to their respective licenses.
 
 ## Citation
 
+If you use the orchestration or experimental methodology from this repository, please preserve the provenance and licensing information for the inherited components.
+
 ```text
 ARC 2026 — NVARC + TRM
-
-Offline ARC-AGI-2 inference with two independent
-neural solver families, single-GPU Kaggle scheduling,
-and label-free evidence selection.
+Offline ARC-AGI-2 inference with independent neural solver families,
+multi-GPU scheduling, and label-free evidence selection.
 
 Copyright 2026 Christopher D. Aleman
 MIT-0
